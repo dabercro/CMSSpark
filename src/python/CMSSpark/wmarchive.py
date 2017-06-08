@@ -16,6 +16,7 @@ import argparse
 import datetime
 import calendar
 from types import NoneType
+from collections import defaultdict
 
 from pyspark import SparkContext, StorageLevel
 from pyspark.sql import HiveContext
@@ -23,6 +24,7 @@ from pyspark.sql import HiveContext
 # CMSSpark modules
 from CMSSpark.spark_utils import avro_rdd, print_rows
 from CMSSpark.spark_utils import spark_context, split_dataset
+from CMSSpark.spark_utils import list_dir
 from CMSSpark.utils import elapsed_time
 
 class OptionParser():
@@ -103,13 +105,32 @@ def range_dates(trange):
 
 def hdfs_path(hdir, dateinput):
     "Construct HDFS path for WMArchive data"
-    dates = dateinput.split('-')
-    if  len(dates) == 2:
-        return ['%s/%s' % (hdir, d) for d in range_dates(dates)]
-    dates = dateinput.split(',')
-    if  len(dates) > 1:
-        return ['%s/%s' % (hdir, hdate(d)) for d in dates]
-    return ['%s/%s' % (hdir, hdate(dateinput))]
+
+    for range_match in re.findall('\d{8}-\d{8}', dateinput):
+        dateinput = dateinput.replace(range_match, ','.join(range_dates(range_match.split('-'))))
+
+    dates = [hdate(d).split('/') for d in dateinput.replace('/', '').split(',')]
+
+    # Let's build a tree of months wanted and check those for dates
+
+    wanted = defaultdict(set)
+
+    for year, month, _ in dates:
+        wanted[year].add(month)
+
+    # Let's build a tree with proper months to confirm that each possible path exists
+
+    print 'Checking if dates are valid ...'
+
+    possible = {
+        year: {
+            month: list_dir(os.path.join(hdir, year, month), relative=True) \
+                for month in wanted[year]
+            } for year in wanted.keys()
+        }
+
+    return [os.path.join(hdir, year, month, day) for year, month, day in dates \
+                if day in possible.get(year, {}).get(month, [])]
 
 def run(fout, hdir, date, yarn=None, verbose=None, workflowtools=False):
     """
@@ -132,14 +153,28 @@ def run(fout, hdir, date, yarn=None, verbose=None, workflowtools=False):
             Adjusted data extration for workflow team.
             """
             task = row.get('task', '')
-            output = {}
-            for step in row.get('steps', []):
-                output[step['name']] = {
-                    'errors': [error.get('exitCode', '') for error in step.get('errors', [])],
-                    'site': step.get('site', '')
-                }
+            output = {
+                step['name']: {
+                    str(error['exitCode']): {step['site']: 1} for error in step.get('errors', [])
+                } for step in row.get('steps', [])
+            }
 
-            return {task: output}
+            return (task, json.dumps(output))
+
+        def merge_errors(*args):
+            """
+            Merge the nested error dictionaries
+            """
+
+            output = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+
+            for arg in [json.loads(arg) for arg in args]:
+                for step, step_vals in arg.items():
+                    for error, error_vals in step_vals.items():
+                        for site, numerrors in error_vals.items():
+                            output[step][error][site] += numerrors
+
+            return json.dumps(output)
 
     else:
         def getdata(row):
@@ -156,6 +191,10 @@ def run(fout, hdir, date, yarn=None, verbose=None, workflowtools=False):
             return {"task":task, "performance": perf, 'sites':sites}
 
     out = rdd.map(lambda r: getdata(r))
+
+    if workflowtools:
+        out = out.reduceByKey(merge_errors)
+
     if  verbose:
         print(out.take(1)) # out here is RDD object
 
