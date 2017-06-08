@@ -35,6 +35,8 @@ class OptionParser():
         msg = 'Location of CMS folders on HDFS, default %s' % hdir
         self.parser.add_argument("--hdir", action="store",
             dest="hdir", default=hdir, help=msg)
+        self.parser.add_argument("--workflowtools", action="store_true",
+            dest="workflowtools", default=False, help="Use parser for workflow errors")
         fout = ''
         self.parser.add_argument("--fout", action="store",
             dest="fout", default=fout, help='Output file name, default %s' % fout)
@@ -109,7 +111,7 @@ def hdfs_path(hdir, dateinput):
         return ['%s/%s' % (hdir, hdate(d)) for d in dates]
     return ['%s/%s' % (hdir, hdate(dateinput))]
 
-def run(fout, hdir, date, yarn=None, verbose=None):
+def run(fout, hdir, date, yarn=None, verbose=None, workflowtools=False):
     """
     Main function to run pyspark job.
     """
@@ -124,18 +126,34 @@ def run(fout, hdir, date, yarn=None, verbose=None):
     # construct here hdfs path and pass empty string as a date
     rdd = avro_rdd(ctx, sqlContext, hdfs_path(hdir, date), date='', verbose=verbose)
 
-    def getdata(row):
-        """
-        Helper function to extract useful data from WMArchive records.
-        You may adjust it to your needs. Given row is a dict object.
-        """
-        task = row.get('task', '')
-        cpu = 0
-        sites = []
-        for step in row.get('steps', []):
-            sites.append(step.get('site', ''))
-            perf = step.get('performance', {})
-        return {"task":task, "performance": perf, 'sites':sites}
+    if workflowtools:
+        def getdata(row):
+            """
+            Adjusted data extration for workflow team.
+            """
+            task = row.get('task', '')
+            output = {}
+            for step in row.get('steps', []):
+                output[step['name']] = {
+                    'errors': [error.get('exitCode', '') for error in step.get('errors', [])],
+                    'site': step.get('site', '')
+                }
+
+            return {task: output}
+
+    else:
+        def getdata(row):
+            """
+            Helper function to extract useful data from WMArchive records.
+            You may adjust it to your needs. Given row is a dict object.
+            """
+            task = row.get('task', '')
+            cpu = 0
+            sites = []
+            for step in row.get('steps', []):
+                sites.append(step.get('site', ''))
+                perf = step.get('performance', {})
+            return {"task":task, "performance": perf, 'sites':sites}
 
     out = rdd.map(lambda r: getdata(r))
     if  verbose:
@@ -157,7 +175,7 @@ def main():
     opts = optmgr.parser.parse_args()
     print("Input arguments: %s" % opts)
     time0 = time.time()
-    run(opts.fout, opts.hdir, opts.date, opts.yarn, opts.verbose)
+    run(opts.fout, opts.hdir, opts.date, opts.yarn, opts.verbose, opts.workflowtools)
     print('Start time  : %s' % time.strftime('%Y-%m-%d %H:%M:%S GMT', time.gmtime(time0)))
     print('End time    : %s' % time.strftime('%Y-%m-%d %H:%M:%S GMT', time.gmtime(time.time())))
     print('Elapsed time: %s sec' % elapsed_time(time0))
